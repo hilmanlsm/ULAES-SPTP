@@ -61,4 +61,4 @@ ciphertext = cipher.encrypt(plaintext)
 print("Ciphertext:", ciphertext)
 
 
-
+[![DOI](https://zenodo.org/badge/1058383909.svg)](https://doi.org/10.5281/zenodo.17139050)

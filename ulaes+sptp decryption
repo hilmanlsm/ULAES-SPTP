@@ -1,0 +1,214 @@
+from random import Random
+import numpy as np
+
+RCON = [
+    0x00, 0x01, 0x02, 0x04, 0x08,
+    0x10, 0x20, 0x40, 0x80, 0x1B, 0x36
+]
+
+# ====== Fungsi pembentukan S-box Dinamis SPTP (4×4) ======
+def modular_inverse(val, mod):
+    val = val % mod
+    for i in range(1, mod):
+        if (val * i) % mod == 1:
+            return i
+    return 0
+
+def square_polynomial_transform(n, A, B):
+    return [((c * (A**2) + B) % (2**n)) for c in range(2**n)]
+
+def modular_multiplicative_inverse_list(l, n):
+    mod = (2**n) + 1
+    return [modular_inverse(x, mod) for x in l]
+
+def dynamic_affine_matrix(V):
+    V = V & 0xF
+    while bin(V).count("1") % 2 == 0:
+        V = (V + 1) % 16
+    bits = [(V >> (3-i)) & 1 for i in range(4)]
+    ATM = np.zeros((4, 4), dtype=int)
+    ATM[:, 0] = bits
+    for j in range(1, 4):
+        ATM[:, j] = np.roll(ATM[:, j-1], -1)
+    return ATM
+
+def affine_transform_list(inverse_list, ATM):
+    result = []
+    for val in inverse_list:
+        b = np.array([(val >> (3-i)) & 1 for i in range(4)], dtype=int)
+        out = np.dot(ATM, b) % 2
+        outval = 0
+        for bit in out:
+            outval = (outval << 1) | int(bit)
+        result.append(outval)
+    return result
+
+def nonlinearity(sbox):
+    from itertools import product
+    n = 4 if len(sbox) == 16 else 8
+    max_nl = 0
+    for coeff in range(1, 2**n):
+        aff = [(bin(coeff & x).count('1') % 2) for x in range(2**n)]
+        hd = sum([a != b for a, b in zip(sbox, aff)])
+        nl = min(hd, len(sbox) - hd)
+        if nl > max_nl:
+            max_nl = nl
+    return max_nl
+
+def sptp_permutation_process(sbox_init, A, B, C, D):
+    n = 4
+    F = sbox_init[:]
+    N1 = nonlinearity(F)
+    z = 1
+    zmax = 2**n - 1
+    MOD16 = 16
+    MOD17 = 17
+    while z <= zmax:
+        m = (((A*z + C) % MOD17) * z + D) % MOD16
+        n_idx = (((B*z + C) % MOD17) * z + D) % MOD16
+        m %= len(F)
+        n_idx %= len(F)
+        F[m], F[n_idx] = F[n_idx], F[m]
+        N2 = nonlinearity(F)
+        if N2 <= N1:
+            F[m], F[n_idx] = F[n_idx], F[m]
+        else:
+            N1 = N2
+        z += 1
+    return F
+
+def generate_dynamic_sbox(key_bytes):
+    n = 4
+    A = key_bytes[0] & 0xF
+    if A % 2 == 0: A = (A - 1) % 16
+    B = key_bytes[1] & 0xF
+    C = key_bytes[2] & 0xF
+    D = key_bytes[3] & 0xF
+    V = key_bytes[4] & 0xF
+    if A == 0: A = 1
+    if B == 0: B = 2
+    if C == 0: C = 3
+    if D == 0: D = 4
+    if V == 0: V = 7
+    step1 = square_polynomial_transform(n, A, B)
+    step2 = modular_multiplicative_inverse_list(step1, n)
+    ATM = dynamic_affine_matrix(V)
+    step3 = affine_transform_list(step2, ATM)
+    return sptp_permutation_process(step3, A, B, C, D)
+
+# ====== Fungsi dasar ======
+def s_box_substitution(byte, sbox):
+    high_nibble = (byte >> 4) & 0x0F
+    low_nibble = byte & 0x0F
+    return (sbox[high_nibble] << 4) | sbox[low_nibble]
+
+def xtime(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else ((a << 1) & 0xFF)
+
+def add_round_key(state, round_key):
+    return [s ^ k for s, k in zip(state, round_key)]
+
+# ====== Key schedule dinamis 4×4 ======
+def rot_word(word):
+    return word[1:] + word[:1]
+
+def sub_word_4x4(word, sbox):
+    return [s_box_substitution(b, sbox) for b in word]
+
+def key_expansion_dynamic(key, sbox_dynamic):
+    Nb, Nk, Nr = 4, 4, 10
+    w = []
+    for i in range(Nk):
+        w.append(key[4*i:4*(i+1)])
+    for i in range(Nk, Nb*(Nr+1)):
+        temp = w[i-1][:]
+        if i % Nk == 0:
+            temp = sub_word_4x4(rot_word(temp), sbox_dynamic)
+            temp[0] ^= RCON[i//Nk]
+        w.append([w[i-Nk][j] ^ temp[j] for j in range(4)])
+    round_keys = []
+    for i in range(Nr+1):
+        rk = []
+        for j in range(4):
+            rk += w[4*i+j]
+        round_keys.append(rk)
+    return round_keys
+
+# ====== Fungsi inverse transform ======
+def inverse_sbox(sbox):
+    inv = [0]*len(sbox)
+    for i, v in enumerate(sbox):
+        inv[v] = i
+    return inv
+
+def inverse_s_box_substitution(byte, sbox_inv):
+    high_nibble = (byte >> 4) & 0x0F
+    low_nibble = byte & 0x0F
+    return (sbox_inv[high_nibble] << 4) | sbox_inv[low_nibble]
+
+def inverse_sub_bytes(state, sbox_inv):
+    return [inverse_s_box_substitution(b, sbox_inv) for b in state]
+
+def inverse_shift_rows(state):
+    mat = [state[i*4:(i+1)*4] for i in range(4)]
+    for i in range(4):
+        mat[i] = mat[i][-i:] + mat[i][:-i]
+    return [mat[i][j] for i in range(4) for j in range(4)]
+
+def mul_by_9(a):  return xtime(xtime(xtime(a))) ^ a
+def mul_by_11(a): return xtime(xtime(xtime(a)) ^ a) ^ a
+def mul_by_13(a): return xtime(xtime(xtime(a) ^ a)) ^ a
+def mul_by_14(a): return xtime(xtime(xtime(a) ^ a) ^ a)
+
+def inverse_mix_single_column(col):
+    a = col
+    return [
+        mul_by_14(a[0]) ^ mul_by_11(a[1]) ^ mul_by_13(a[2]) ^ mul_by_9(a[3]),
+        mul_by_9(a[0])  ^ mul_by_14(a[1]) ^ mul_by_11(a[2]) ^ mul_by_13(a[3]),
+        mul_by_13(a[0]) ^ mul_by_9(a[1])  ^ mul_by_14(a[2]) ^ mul_by_11(a[3]),
+        mul_by_11(a[0]) ^ mul_by_13(a[1]) ^ mul_by_9(a[2])  ^ mul_by_14(a[3]),
+    ]
+
+def inverse_mix_columns(state):
+    out = [0]*16
+    for c in range(4):
+        col = [state[r*4 + c] for r in range(4)]
+        mixed = inverse_mix_single_column(col)
+        for r in range(4):
+            out[r*4 + c] = mixed[r]
+    return out
+
+# ====== Fungsi utama dekripsi ======
+def ul_aes_decrypt_block(ciphertext, key):
+    assert len(ciphertext) == 16 and len(key) == 16
+    sbox_dynamic = generate_dynamic_sbox(key)
+    sbox_inv = inverse_sbox(sbox_dynamic)
+    round_keys = key_expansion_dynamic(key, sbox_dynamic)
+
+    state = list(ciphertext)
+    state = add_round_key(state, round_keys[10])
+    state = inverse_shift_rows(state)
+    state = inverse_sub_bytes(state, sbox_inv)
+
+    for rnd in range(9, 0, -1):
+        state = add_round_key(state, round_keys[rnd])
+        state = inverse_mix_columns(state)
+        state = inverse_shift_rows(state)
+        state = inverse_sub_bytes(state, sbox_inv)
+
+    state = add_round_key(state, round_keys[0])
+    return state
+
+# ====== Contoh penggunaan ======
+if __name__ == "__main__":
+    # Ganti ciphertext sesuai hasil enkripsi Anda
+    ciphertext = [0x23, 0x70, 0xb4, 0xcf, 0x9a, 0x5b, 0xa7, 0x1f, 0xef, 0x4e, 0x6c, 0x39, 0xa4, 0x30, 0xa6, 0x0]
+    key = [0x44, 0x7e, 0x15, 0x16,
+           0x28, 0xae, 0xd2, 0xa6,
+           0xab, 0xf7, 0x97, 0x75,
+           0x55, 0x63, 0x8c, 0x7f]
+
+    plaintext = ul_aes_decrypt_block(ciphertext, key)
+    print("Ciphertext :", [hex(b) for b in ciphertext])
+    print("Key        :", [hex(b) for b in key])
+    print("Plaintext  :", [hex(b) for b in plaintext])

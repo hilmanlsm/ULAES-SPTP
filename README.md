@@ -42,7 +42,7 @@ bash
 pip install -r requirements.txt
 
 
-Usage
+#Usage
 
 Example of running the encryption:
 from ulaes_sptp import ULAES
